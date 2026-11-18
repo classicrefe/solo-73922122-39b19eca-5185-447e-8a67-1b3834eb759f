@@ -10,6 +10,8 @@ from fastapi.responses import JSONResponse
 
 from .config import settings
 from .schemas import (
+    ClaimCorrectionRequest,
+    ClaimCorrectionResult,
     ClaimIn,
     ClaimOut,
     ClaimPage,
@@ -190,6 +192,50 @@ async def fetch_claims(
         snapshot_time=session.snapshot_time,
         rows=[ClaimRow(**row) for row in rows],
     )
+
+
+# ----------------------------------------------------------------------
+# 理赔金额整批更正
+# 快照核对走会话只读事务；源端复核与整批写入走池连接上的独立写事务，
+# 全部成功才 COMMIT，任一不符整批回滚，不留部分更正。
+# ----------------------------------------------------------------------
+@app.post(
+    "/claim-corrections",
+    response_model=ClaimCorrectionResult,
+    status_code=200,
+    tags=["corrections"],
+    summary="按会话快照整批更正理赔金额（整批成功或整批拒绝）",
+    responses={
+        404: {"model": Message, "description": "会话不存在或已失效"},
+        409: {
+            "model": Message,
+            "description": "快照不符 / 源端已改动 / 关闭已受理，整批拒绝",
+        },
+        410: {"model": Message, "description": "会话已到期，批次不得开始"},
+        422: {"model": Message, "description": "请求体校验失败（重复 id、金额规则等）"},
+        503: {"model": Message, "description": "快照连接失效，会话作废"},
+    },
+)
+async def claim_corrections(body: ClaimCorrectionRequest, request: Request):
+    # 演示用钩子：让批次在快照核对之后、源端写入之前睡眠，
+    # 以便构造"批次进行中关闭/到期"的交错，仅 ENABLE_DEBUG_HOOKS=true 生效。
+    delay = 0.0
+    if settings.enable_debug_hooks:
+        raw = request.headers.get("x-debug-sleep-seconds")
+        if raw:
+            try:
+                delay = max(0.0, min(30.0, float(raw)))
+            except ValueError:
+                raise HTTPException(status_code=400, detail="非法的调试延迟头")
+
+    corrections = [
+        (item.claim_id, item.observed_amount, item.new_amount)
+        for item in body.corrections
+    ]
+    result = await asyncio.to_thread(
+        manager.submit_corrections, body.session_id, corrections, delay
+    )
+    return ClaimCorrectionResult(**result)
 
 
 # ----------------------------------------------------------------------

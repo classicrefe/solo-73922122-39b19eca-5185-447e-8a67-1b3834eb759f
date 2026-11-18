@@ -7,6 +7,7 @@
 """
 from __future__ import annotations
 
+import concurrent.futures
 import os
 import threading
 import time
@@ -24,6 +25,9 @@ os.environ.setdefault("SESSION_TTL_SECONDS", "2")
 os.environ.setdefault("ENABLE_DEBUG_HOOKS", "true")
 os.environ.setdefault("SWEEPER_INTERVAL_SECONDS", "0.1")
 
+# 测试端口可用 TEST_PORT 覆盖，避免与环境中残留的实例冲突
+TEST_PORT = int(os.environ.get("TEST_PORT", "18080"))
+
 from app.config import settings  # noqa: E402
 from app.main import app, manager  # noqa: E402
 from app.session_manager import SessionError  # noqa: E402
@@ -32,9 +36,18 @@ SEED_SQL = os.path.join(os.path.dirname(__file__), "..", "db", "init", "02_seed.
 
 
 def reset_seed_data() -> None:
-    """每个用例前重置演示数据，保证改/删类测试可重复运行。"""
+    """每个用例前重置演示数据，保证改/删类测试可重复运行。
+
+    用 DELETE 取代种子脚本里的 TRUNCATE：DELETE 只取 RowExclusiveLock，
+    与快照会话持有的 AccessShareLock 兼容（MVCC），不会因环境中残留的
+    只读事务而排队；序列重置交给种子脚本末尾的 setval 完成。
+    """
     with open(SEED_SQL, encoding="utf-8") as fh:
         sql = fh.read()
+    sql = sql.replace(
+        "TRUNCATE claims, policies RESTART IDENTITY CASCADE;",
+        "DELETE FROM claims; DELETE FROM policies;",
+    )
     with psycopg.connect(settings.database_url, autocommit=True) as conn:
         conn.execute(sql)
 
@@ -52,7 +65,7 @@ class ApiTestBase(unittest.TestCase):
     def setUpClass(cls):
         if ApiTestBase._server is None:
             config = uvicorn.Config(
-                "app.main:app", host="127.0.0.1", port=18080,
+                "app.main:app", host="127.0.0.1", port=TEST_PORT,
                 log_level="warning",
             )
             ApiTestBase._server = uvicorn.Server(config)
@@ -63,14 +76,16 @@ class ApiTestBase(unittest.TestCase):
             ApiTestBase._server_thread.start()
             for _ in range(100):
                 try:
-                    httpx.get("http://127.0.0.1:18080/health", timeout=1)
+                    httpx.get(
+                        f"http://127.0.0.1:{TEST_PORT}/health", timeout=1
+                    )
                     break
                 except httpx.TransportError:
                     time.sleep(0.1)
             # 全套件以干净的种子数据开始
             reset_seed_data()
         cls.client = httpx.Client(
-            base_url="http://127.0.0.1:18080", timeout=15
+            base_url=f"http://127.0.0.1:{TEST_PORT}", timeout=15
         )
 
     @classmethod
@@ -106,6 +121,33 @@ class ApiTestBase(unittest.TestCase):
             params={"page": page, "page_size": page_size},
             headers=headers or {},
         )
+
+    def correct(self, sid, corrections, headers=None):
+        return self.client.post(
+            "/claim-corrections",
+            json={"session_id": sid, "corrections": corrections},
+            headers=headers or {},
+        )
+
+    def source_amounts(self, claim_ids):
+        """直接读源库当前已提交的金额，绕过快照会话。"""
+        with psycopg.connect(settings.database_url, autocommit=True) as conn:
+            rows = conn.execute(
+                "SELECT id, amount FROM claims WHERE id = ANY(%s)",
+                (list(claim_ids),),
+            ).fetchall()
+        return {cid: amt for cid, amt in rows}
+
+    def source_row(self, claim_id):
+        with psycopg.connect(settings.database_url, autocommit=True) as conn:
+            return conn.execute(
+                """
+                SELECT c.id, c.policy_id, p.region, c.amount
+                  FROM claims c JOIN policies p ON p.id = c.policy_id
+                 WHERE c.id = %s
+                """,
+                (claim_id,),
+            ).fetchone()
 
 
 class TestPagination(ApiTestBase):
@@ -362,7 +404,7 @@ class TestConnectionLossAndRestart(ApiTestBase):
         ApiTestBase._server.should_exit = True
         ApiTestBase._server_thread.join(timeout=10)
         config = uvicorn.Config(
-            "app.main:app", host="127.0.0.1", port=18080, log_level="warning",
+            "app.main:app", host="127.0.0.1", port=TEST_PORT, log_level="warning",
         )
         ApiTestBase._server = uvicorn.Server(config)
         ApiTestBase._server_thread = threading.Thread(
@@ -373,7 +415,7 @@ class TestConnectionLossAndRestart(ApiTestBase):
         for _ in range(100):
             try:
                 if httpx.get(
-                    "http://127.0.0.1:18080/health", timeout=1
+                    f"http://127.0.0.1:{TEST_PORT}/health", timeout=1
                 ).status_code == 200:
                     return
             except httpx.TransportError:
@@ -395,6 +437,414 @@ class TestConnectionLossAndRestart(ApiTestBase):
         s2 = self.open("华南")
         self.assertEqual(s2["status"], "open")
         self.close(s2["session_id"])
+
+
+class TestClaimCorrections(ApiTestBase):
+    """POST /claim-corrections：快照核对、整批原子、源端防覆盖与并发。"""
+
+    def setUp(self):
+        super().setUp()
+        reset_seed_data()  # 更正类用例会改金额，每个用例从干净种子开始
+
+    def _two_huabei_claims(self, sid):
+        """取会话首页前两条华北理赔，返回 (id, amount) 列表。"""
+        body = self.page(sid, page_size=10).json()["rows"]
+        return [(r["claim_id"], r["amount"]) for r in body[:2]]
+
+    def test_happy_path_batch_updates_and_response_shape(self):
+        s = self.open("华北")
+        sid = s["session_id"]
+        (id1, amt1), (id2, amt2) = self._two_huabei_claims(sid)
+        r = self.correct(sid, [
+            {"claim_id": id1, "observed_amount": amt1, "new_amount": amt1 + 500},
+            {"claim_id": id2, "observed_amount": amt2, "new_amount": 0},
+        ])
+        self.assertEqual(r.status_code, 200, r.text)
+        body = r.json()
+        self.assertEqual(body["session_id"], sid)
+        self.assertEqual(body["region"], "华北")
+        self.assertEqual(body["updated_count"], 2)
+        self.assertEqual(len(body["corrections"]), 2)
+        self.assertEqual(body["corrections"][0],
+                         {"claim_id": id1, "old_amount": amt1, "new_amount": amt1 + 500})
+        self.assertEqual(body["corrections"][1],
+                         {"claim_id": id2, "old_amount": amt2, "new_amount": 0})
+        self.assertIn("committed_at", body)
+        # 源库确实落库
+        self.assertEqual(self.source_amounts([id1, id2]),
+                         {id1: amt1 + 500, id2: 0})
+
+    def test_old_session_keeps_old_amount_new_session_reads_new(self):
+        s = self.open("华北")
+        sid = s["session_id"]
+        (id1, amt1), _ = self._two_huabei_claims(sid)
+        r = self.correct(sid, [
+            {"claim_id": id1, "observed_amount": amt1, "new_amount": amt1 + 777},
+        ])
+        self.assertEqual(r.status_code, 200, r.text)
+
+        # 旧会话快照固定，仍读旧金额
+        old_rows = {row["claim_id"]: row["amount"]
+                    for row in self.page(sid, page_size=10).json()["rows"]}
+        self.assertEqual(old_rows[id1], amt1)
+
+        # 新会话读到更正值
+        s2 = self.open("华北")
+        new_rows = {row["claim_id"]: row["amount"]
+                    for row in self.page(s2["session_id"], page_size=10).json()["rows"]}
+        self.assertEqual(new_rows[id1], amt1 + 777)
+        self.close(s2["session_id"])
+
+    def test_snapshot_mismatch_wrong_observed_amount_rejects_all(self):
+        s = self.open("华北")
+        sid = s["session_id"]
+        (id1, amt1), (id2, amt2) = self._two_huabei_claims(sid)
+        before = self.source_amounts([id1, id2])
+        r = self.correct(sid, [
+            # 所见金额故意填错
+            {"claim_id": id1, "observed_amount": amt1 + 999, "new_amount": 1},
+            {"claim_id": id2, "observed_amount": amt2, "new_amount": 2},
+        ])
+        self.assertEqual(r.status_code, 409)
+        self.assertEqual(r.json()["code"], "snapshot_mismatch")
+        self.assertIn(str(id1), r.json()["detail"])
+        # 整批拒绝：两条都没动
+        self.assertEqual(self.source_amounts([id1, id2]), before)
+
+    def test_snapshot_mismatch_claim_from_other_region(self):
+        s = self.open("华北")
+        sid = s["session_id"]
+        # 华东的理赔不在华北会话快照里
+        east = self.client.post("/sessions", json={"region": "华东"})
+        east_row = self.page(east.json()["session_id"], page_size=1).json()["rows"][0]
+        self.close(east.json()["session_id"])
+        r = self.correct(sid, [{
+            "claim_id": east_row["claim_id"],
+            "observed_amount": east_row["amount"],
+            "new_amount": east_row["amount"] + 1,
+        }])
+        self.assertEqual(r.status_code, 409)
+        self.assertEqual(r.json()["code"], "snapshot_mismatch")
+
+    def test_snapshot_mismatch_unknown_claim_id(self):
+        s = self.open("华北")
+        r = self.correct(s["session_id"], [{
+            "claim_id": 99999999, "observed_amount": 1, "new_amount": 2,
+        }])
+        self.assertEqual(r.status_code, 409)
+        self.assertEqual(r.json()["code"], "snapshot_mismatch")
+
+    def test_request_validation_duplicates_and_amount_rules(self):
+        s = self.open("华北")
+        sid = s["session_id"]
+        (id1, amt1), _ = self._two_huabei_claims(sid)
+        # 重复 id
+        r = self.correct(sid, [
+            {"claim_id": id1, "observed_amount": amt1, "new_amount": amt1 + 1},
+            {"claim_id": id1, "observed_amount": amt1, "new_amount": amt1 + 2},
+        ])
+        self.assertEqual(r.status_code, 422)
+        # 新金额与所见相同
+        r = self.correct(sid, [
+            {"claim_id": id1, "observed_amount": amt1, "new_amount": amt1},
+        ])
+        self.assertEqual(r.status_code, 422)
+        # 负数金额
+        r = self.correct(sid, [
+            {"claim_id": id1, "observed_amount": amt1, "new_amount": -1},
+        ])
+        self.assertEqual(r.status_code, 422)
+        # 空批次
+        r = self.client.post("/claim-corrections",
+                             json={"session_id": sid, "corrections": []})
+        self.assertEqual(r.status_code, 422)
+
+    def test_batch_limit_is_twenty(self):
+        s = self.open("华北")
+        sid = s["session_id"]
+        rows = self.page(sid, page_size=100).json()["rows"]
+        twenty = [
+            {"claim_id": r["claim_id"],
+             "observed_amount": r["amount"],
+             "new_amount": r["amount"] + 1}
+            for r in rows[:20]
+        ]
+        r = self.correct(sid, twenty)
+        self.assertEqual(r.status_code, 200, r.text)
+        self.assertEqual(r.json()["updated_count"], 20)
+
+    def test_unknown_session_404(self):
+        r = self.correct("no-such-session", [
+            {"claim_id": 1, "observed_amount": 1, "new_amount": 2},
+        ])
+        self.assertEqual(r.status_code, 404)
+        self.assertEqual(r.json()["code"], "session_not_found")
+
+    def test_closed_session_cannot_start_batch(self):
+        s = self.open("华北")
+        sid = s["session_id"]
+        (id1, amt1), _ = self._two_huabei_claims(sid)
+        self.close(sid)
+        r = self.correct(sid, [
+            {"claim_id": id1, "observed_amount": amt1, "new_amount": amt1 + 1},
+        ])
+        self.assertEqual(r.status_code, 409)
+        self.assertEqual(r.json()["code"], "session_not_open")
+
+    def test_expired_session_cannot_start_batch(self):
+        s = self.open("华北")
+        sid = s["session_id"]
+        (id1, amt1), _ = self._two_huabei_claims(sid)
+        time.sleep(TTL + 0.6)
+        r = self.correct(sid, [
+            {"claim_id": id1, "observed_amount": amt1, "new_amount": amt1 + 1},
+        ])
+        self.assertIn(r.status_code, (409, 410))
+        self.assertIn(r.json()["code"], ("session_not_open", "session_expired"))
+
+    def test_source_amount_changed_by_other_writer_whole_batch_rolls_back(self):
+        s = self.open("华北")
+        sid = s["session_id"]
+        (id1, amt1), (id2, amt2) = self._two_huabei_claims(sid)
+        # 别人通过源端接口抢先改了 id2（会话快照仍记录旧值）
+        self.assertEqual(self.client.patch(
+            f"/admin/claims/{id2}", params={"amount": amt2 + 31337}
+        ).status_code, 200)
+        before = self.source_amounts([id1, id2])
+        r = self.correct(sid, [
+            {"claim_id": id1, "observed_amount": amt1, "new_amount": amt1 + 1},
+            {"claim_id": id2, "observed_amount": amt2, "new_amount": amt2 + 2},
+        ])
+        self.assertEqual(r.status_code, 409)
+        self.assertEqual(r.json()["code"], "source_changed")
+        self.assertIn(str(id2), r.json()["detail"])
+        # 整批回滚：id1 也不能被写入，源端他人改动保持不变
+        self.assertEqual(self.source_amounts([id1, id2]), before)
+
+    def test_source_policy_reassignment_detected(self):
+        s = self.open("华北")
+        sid = s["session_id"]
+        (id1, amt1), _ = self._two_huabei_claims(sid)
+        # 源端把理赔挂到华东保单下（归属/地区都变了）
+        with psycopg.connect(settings.database_url, autocommit=True) as conn:
+            conn.execute("UPDATE claims SET policy_id = 3 WHERE id = %s", (id1,))
+        r = self.correct(sid, [
+            {"claim_id": id1, "observed_amount": amt1, "new_amount": amt1 + 1},
+        ])
+        self.assertEqual(r.status_code, 409)
+        self.assertEqual(r.json()["code"], "source_changed")
+
+    def test_source_claim_deleted_detected(self):
+        s = self.open("华北")
+        sid = s["session_id"]
+        (id1, amt1), _ = self._two_huabei_claims(sid)
+        self.assertEqual(self.client.delete(f"/admin/claims/{id1}").status_code, 204)
+        r = self.correct(sid, [
+            {"claim_id": id1, "observed_amount": amt1, "new_amount": amt1 + 1},
+        ])
+        self.assertEqual(r.status_code, 409)
+        self.assertEqual(r.json()["code"], "source_changed")
+
+    def test_concurrent_batches_same_claim_only_one_succeeds(self):
+        """两个会话的并发批次改同一理赔：先提交者成功，后到者整批拒绝。"""
+        s1 = self.open("华北")
+        s2 = self.open("华北")
+        sid1, sid2 = s1["session_id"], s2["session_id"]
+        (id1, amt1), (id2, amt2) = self._two_huabei_claims(sid1)
+
+        barrier = threading.Barrier(2)
+
+        def call_correct(sid, new_delta, sleep_s):
+            barrier.wait()
+            return self.client.post(
+                "/claim-corrections",
+                json={"session_id": sid, "corrections": [
+                    {"claim_id": id1, "observed_amount": amt1,
+                     "new_amount": amt1 + new_delta},
+                ]},
+                headers={"X-Debug-Sleep-Seconds": str(sleep_s)},
+                timeout=20,
+            )
+
+        with concurrent.futures.ThreadPoolExecutor(max_workers=2) as pool:
+            f1 = pool.submit(call_correct, sid1, 111, 1.5)
+            f2 = pool.submit(call_correct, sid2, 222, 0.0)
+            r1, r2 = f1.result(), f2.result()
+
+        statuses = sorted((r1.status_code, r2.status_code))
+        self.assertEqual(statuses, [200, 409], (r1.text, r2.text))
+        winner = r1 if r1.status_code == 200 else r2
+        loser = r2 if r1.status_code == 200 else r1
+        self.assertEqual(loser.json()["code"], "source_changed")
+        # 源库只保留胜出批次的值
+        self.assertEqual(self.source_amounts([id1])[id1],
+                         winner.json()["corrections"][0]["new_amount"])
+        self.close(sid1)
+        self.close(sid2)
+
+    def test_concurrent_batches_different_claims_both_succeed(self):
+        s1 = self.open("华北")
+        s2 = self.open("华北")
+        sid1, sid2 = s1["session_id"], s2["session_id"]
+        (id1, amt1), (id2, amt2) = self._two_huabei_claims(sid1)
+        barrier = threading.Barrier(2)
+
+        def call_correct(sid, cid, amt, delta, sleep_s):
+            barrier.wait()
+            return self.client.post(
+                "/claim-corrections",
+                json={"session_id": sid, "corrections": [
+                    {"claim_id": cid, "observed_amount": amt,
+                     "new_amount": amt + delta},
+                ]},
+                headers={"X-Debug-Sleep-Seconds": str(sleep_s)},
+                timeout=20,
+            )
+
+        with concurrent.futures.ThreadPoolExecutor(max_workers=2) as pool:
+            f1 = pool.submit(call_correct, sid1, id1, amt1, 111, 1.0)
+            f2 = pool.submit(call_correct, sid2, id2, amt2, 222, 0.0)
+            r1, r2 = f1.result(), f2.result()
+        self.assertEqual(r1.status_code, 200, r1.text)
+        self.assertEqual(r2.status_code, 200, r2.text)
+        self.assertEqual(self.source_amounts([id1, id2]),
+                         {id1: amt1 + 111, id2: amt2 + 222})
+        self.close(sid1)
+        self.close(sid2)
+
+    def test_concurrent_overlapping_batches_whole_loser_rolls_back(self):
+        """两批部分重叠（共享一个 id）：一批成功，另一批整批回滚。"""
+        s1 = self.open("华北")
+        s2 = self.open("华北")
+        sid1, sid2 = s1["session_id"], s2["session_id"]
+        rows = self.page(sid1, page_size=10).json()["rows"]
+        id_a, amt_a = rows[2]["claim_id"], rows[2]["amount"]
+        id_b, amt_b = rows[3]["claim_id"], rows[3]["amount"]
+        barrier = threading.Barrier(2)
+
+        def overlap(i):
+            barrier.wait()
+            if i == 0:
+                # 双条批次故意变慢，让单条批次先拿到共享行的锁
+                return self.correct(sid1, [
+                    {"claim_id": id_a, "observed_amount": amt_a,
+                     "new_amount": amt_a + 11},
+                    {"claim_id": id_b, "observed_amount": amt_b,
+                     "new_amount": amt_b + 11},
+                ], headers={"X-Debug-Sleep-Seconds": "1.5"})
+            return self.correct(sid2, [
+                {"claim_id": id_b, "observed_amount": amt_b,
+                 "new_amount": amt_b + 22},
+            ])
+
+        with concurrent.futures.ThreadPoolExecutor(max_workers=2) as pool:
+            results = list(pool.map(overlap, range(2)))
+        statuses = sorted(r.status_code for r in results)
+        self.assertEqual(statuses, [200, 409], [r.text for r in results])
+        winner = next(r for r in results if r.status_code == 200)
+        loser = next(r for r in results if r.status_code == 409)
+        self.assertEqual(loser.json()["code"], "source_changed")
+        source = self.source_amounts([id_a, id_b])
+        if len(winner.json()["corrections"]) == 2:
+            # 双条批次胜出：两行都落库
+            self.assertEqual(source, {id_a: amt_a + 11, id_b: amt_b + 11})
+        else:
+            # 单条批次胜出：仅 id_b 更新，id_a 保持原值（双条批次整批回滚）
+            self.assertEqual(source, {id_a: amt_a, id_b: amt_b + 22})
+        self.close(sid1)
+        self.close(sid2)
+
+    def test_close_waits_for_inflight_correction_then_releases_snapshot(self):
+        """关闭与已开始批次交错：批次先确定提交，关闭才释放快照。"""
+        s = self.open("华北")
+        sid = s["session_id"]
+        (id1, amt1), _ = self._two_huabei_claims(sid)
+        box = {}
+
+        def slow_correct():
+            box["t0"] = time.time()
+            box["r"] = self.correct(
+                sid,
+                [{"claim_id": id1, "observed_amount": amt1,
+                  "new_amount": amt1 + 4242}],
+                headers={"X-Debug-Sleep-Seconds": "3"},
+            )
+            box["t1"] = time.time()
+
+        t = threading.Thread(target=slow_correct)
+        t.start()
+        time.sleep(0.8)  # 确保批次已开始（快照核对完成、持有 io_lock）
+        t_close0 = time.time()
+        close_r = self.close(sid)
+        t_close1 = time.time()
+        t.join()
+        # 批次已开始：允许提交成功
+        self.assertEqual(box["r"].status_code, 200, box["r"].text)
+        self.assertEqual(self.source_amounts([id1])[id1], amt1 + 4242)
+        # 关闭在批次确定终态后才完成（等到了慢批次结束）
+        self.assertGreaterEqual(t_close1 - t_close0, 1.5)
+        self.assertEqual(close_r.status_code, 200)
+        self.assertEqual(close_r.json()["status"], "closed")
+        # 快照随后已释放：新批次/取页不能再开始
+        again = self.correct(sid, [
+            {"claim_id": id1, "observed_amount": amt1 + 4242,
+             "new_amount": amt1 + 1},
+        ])
+        self.assertEqual(again.status_code, 409)
+        # 名额已归还，可开新会话读到更正值
+        s2 = self.open("华北")
+        rows = {r["claim_id"]: r["amount"]
+                for r in self.page(s2["session_id"], page_size=10).json()["rows"]}
+        self.assertEqual(rows[id1], amt1 + 4242)
+        self.close(s2["session_id"])
+
+    def test_close_accepted_before_batch_starts_rejects_batch(self):
+        """关闭先被受理（批次在 io_lock 排队）：批次不得开始、零写入。"""
+        s = self.open("华北")
+        sid = s["session_id"]
+        (id1, amt1), _ = self._two_huabei_claims(sid)
+        before = self.source_amounts([id1])
+        box = {}
+
+        def slow_page_then_correct():
+            # 先用慢取页占住 io_lock，关闭在此期间受理；
+            # 取页结束后更正批次才拿到锁，复核到 closing 必须拒绝。
+            box["page"] = self.page(
+                sid, page_size=5, headers={"X-Debug-Sleep-Seconds": "3"}
+            )
+            box["correct"] = self.correct(sid, [
+                {"claim_id": id1, "observed_amount": amt1,
+                 "new_amount": amt1 + 9090},
+            ])
+
+        t = threading.Thread(target=slow_page_then_correct)
+        t.start()
+        time.sleep(0.8)
+        close_r = self.close(sid)
+        t.join()
+        self.assertEqual(close_r.json()["status"], "closed")
+        self.assertIn(box["page"].status_code, (409, 410))
+        self.assertEqual(box["correct"].status_code, 409)
+        self.assertEqual(box["correct"].json()["code"], "session_not_open")
+        self.assertEqual(self.source_amounts([id1]), before)
+
+    def test_pagination_and_admin_writes_remain_unchanged(self):
+        """新功能不破坏原有分页与源端写入路径。"""
+        s = self.open("华南")
+        sid = s["session_id"]
+        body = self.page(sid, page_size=100).json()
+        self.assertEqual(len(body["rows"]), 40)
+        self.assertFalse(body["has_more"])
+        pol = self.client.post("/admin/policies", json={"region": "华南"})
+        self.assertEqual(pol.status_code, 201)
+        nc = self.client.post(
+            "/admin/claims",
+            json={"policy_id": pol.json()["id"], "amount": 123},
+        )
+        self.assertEqual(nc.status_code, 201)
+        # 快照内依旧 40 行，源端写入不进快照
+        self.assertEqual(len(self.page(sid, page_size=100).json()["rows"]), 40)
+        self.close(sid)
 
 
 if __name__ == "__main__":
